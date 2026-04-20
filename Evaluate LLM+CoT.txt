@@ -1,0 +1,200 @@
+def evaluate_reward_function_with_llm(power_loss, heat_loss, prev_power_loss, prev_heat_loss,
+                                      total_cost, h2_cost, 
+                                      component_operation_cost, pv_curtailment_cost,
+                                      client, model_name, session_id):
+    """
+    Dynamically evaluate performance based on improvement trends (vs previous iteration) 
+    and domain knowledge regarding cost-loss trade-offs.
+    """
+    api_start = time.perf_counter()
+    def calc_change_str(current, prev):
+        if prev is None:
+            return "N/A (First Iteration)"
+        if prev == 0:
+            return "N/A (Previous was 0)"
+        change = ((current - prev) / prev) * 100
+        sign = "+" if change > 0 else ""
+        return f"{sign}{change:.2f}%"
+
+    power_change_str = calc_change_str(power_loss, prev_power_loss)
+    heat_change_str = calc_change_str(heat_loss, prev_heat_loss)
+    
+    prev_p_val = f"{prev_power_loss:.2f}" if prev_power_loss is not None else "None"
+    prev_h_val = f"{prev_heat_loss:.2f}" if prev_heat_loss is not None else "None"
+
+    evaluation_prompt = f"""
+You are an expert in energy system optimization (Hydrogen-based Multi-energy System).
+Please evaluate the Power Loss and Heat Loss reliability based on the current simulation results (28-day cumulative) compared to the previous iteration.
+
+### Data Overview
+1. Economic Indicators (28 days):
+Total  Cost: {total_cost:.2f} Yuan
+Hydrogen Cost: {h2_cost:.2f} Yuan
+Equipment Operation Cost: {component_operation_cost:.2f} Yuan
+PV Curtailment Cost: {pv_curtailment_cost:.2f} Yuan
+
+2. Reliability Indicators (Target: Minimize Loss):
+Power Loss: {power_loss:.2f} kWh (Previous: {prev_p_val} kWh, Change: {power_change_str})
+Heat Loss: {heat_loss:.2f} kWh (Previous: {prev_h_val} kWh, Change: {heat_change_str})
+
+### Evaluation Criteria
+Please assess the "power_loss_evaluation" and "heat_loss_evaluation" using the labels: ["very good", "good", "not good", "bad"].
+
+Judgment Logic:
+1. Trend Analysis: Significant reduction (negative change %) is highly positive. 
+   Increasing loss (positive change %) is negative.
+2. Absolute Magnitude & Domain Knowledge: Compare the loss energy (kWh) with the Total Cost. 
+c  Consider the trade-off: Is the system sacrificing a tiny bit of load reliability to save huge costs?
+
+### Output Format
+Reply ONLY in the following JSON format:
+{{
+    "power_loss_evaluation": "very good/good/not good/bad",
+    "heat_loss_evaluation": "very good/good/not good/bad", 
+    "reasoning": "Brief analysis of the trend (e.g., 'Reduced by 20%') and the magnitude relative to cost."
+}}
+"""
+    
+    messages = [
+        {"role": "system", "content": "You are an energy system optimization expert."},
+        {"role": "user", "content": evaluation_prompt}
+    ]
+    
+    try:
+        response = client.chat.completions.create(
+            messages=messages,
+            model=model_name,
+            temperature=0.3,
+            timeout=60
+        )
+        
+        result = response.choices[0].message.content
+        
+        import re
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            evaluation_result = json.loads(json_match.group(0))
+            
+            eval_save_path = Path("evaluation_results") / session_id
+            eval_save_path.mkdir(parents=True, exist_ok=True)
+            
+            eval_file = eval_save_path / f"llm_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(eval_file, 'w', encoding='utf-8') as f:
+                json.dump(evaluation_result, f, indent=2, ensure_ascii=False)
+            
+            print(f"✅ LLM evaluation completed: P-Loss {power_change_str}, H-Loss {heat_change_str}")
+            print(f"   Reasoning: {evaluation_result.get('reasoning', 'No reasoning')}")
+            api_duration = time.perf_counter() - api_start
+            return evaluation_result["power_loss_evaluation"], evaluation_result["heat_loss_evaluation"], api_duration
+        else:
+            print("❌ Failed to parse LLM evaluation results")
+            return "not good", "not good", 0 
+            
+    except Exception as e:
+        print(f"❌ LLM evaluation failed: {e}")
+        return "not good", "not good", 0
+
+
+
+# CoT suggestions for penalty function optimization
+def generate_cot_suggestions(total_cost, h2_cost, component_operation_cost, pv_curtailment_cost, 
+                             power_loss, heat_loss, power_loss_eval, heat_loss_eval, 
+                             current_params=None, total_train_reward=None):
+    """
+    Generate Chain of Thought suggestions for penalty function optimization
+    Considering the reward = -(total_cost + power_loss_reward + heat_loss_reward) relationship
+    """
+    suggestions = []
+    
+    suggestions.append("Based on the given feedback, adjust the parameters of the penalty function. Let's think step by step:")
+    suggestions.append("1. ANALYSIS: Check current performance against safety constraints and economic goals.")
+    
+    if current_params:
+        power_eta1 = current_params["power_params"]["eta1"]
+        heat_eta1 = current_params["heat_params"]["eta1"]
+        suggestions.append(f"   - Current Parameters: Power eta1={power_eta1}, Heat eta1={heat_eta1}")
+    
+    suggestions.append(f"   - Loss Status: Power_loss={power_loss:.2f} ({power_loss_eval}), Heat_loss={heat_loss:.2f} ({heat_loss_eval})")
+    suggestions.append(f"   - Cost Breakdown: H2={h2_cost:.2f}, Ops={component_operation_cost:.2f}, PV_curt={pv_curtailment_cost:.2f}")
+    
+    AGGRESSIVE = "SIGNIFICANTLY INCREASE (e.g., multiply by 2.0 or add 50-100)"
+    MODERATE = "INCREASE (e.g., add 20-50)"
+    SLIGHT_INC = "SLIGHTLY INCREASE (e.g., add 5-10)"
+    SLIGHT_DEC = "SLIGHTLY DECREASE (e.g., subtract 5-10)"
+
+
+    if power_loss > 1000 or heat_loss > 1000:
+        suggestions.append("2. MATHEMATICAL INSIGHT: The losses are massive (>1000). This likely means the current calculated penalty is SMALLER than the cost (e.g., H2 price) required to fix the loss.")
+        suggestions.append("   - The RL agent is choosing to 'pay the fine' rather than 'buy the fuel' because the fine is too cheap.")
+        suggestions.append(f"   - STRATEGY: You must invert this relationship by {AGGRESSIVE} parameters.")
+
+    suggestions.append("3. POWER PARAMETER STRATEGY:")
+    if power_loss_eval == "bad": 
+        suggestions.append(f"   - CRITICAL: Power loss ({power_loss:.2f}) is SEVERELY above target (10).")
+        suggestions.append(f"   - ACTION: {AGGRESSIVE} power_params (eta1/eta2/eta3).")
+        if total_cost > 1e6:
+             suggestions.append("   - IGNORE the high total cost for now. Safety constraints are the hard threshold; economy is secondary.")
+    
+    elif power_loss_eval == "not good":  
+        suggestions.append(f"   - STATUS: Power loss ({power_loss:.2f}) is unacceptable but improving. {MODERATE} power_params to push it below 100.")
+    
+    elif power_loss_eval == "good": 
+        if total_cost > 1e6:
+            suggestions.append(f"   - STATUS: Power loss is controlled ({power_loss:.2f}), but cost is high.")
+            suggestions.append(f"   - ACTION: Consider {SLIGHT_DEC} power penalties to allow the agent slightly more flexibility to reduce costs.")
+        else:
+            suggestions.append("   - STATUS: Power loss is controlled. Maintain current power parameters.")
+    
+    else:  # "very good" <= 10
+        suggestions.append("   - STATUS: Power loss is perfect. Focus entirely on optimizing heat parameters or reducing cost.")
+
+    suggestions.append("4. HEAT PARAMETER STRATEGY:")
+    if heat_loss_eval == "bad":  
+        suggestions.append(f"   - CRITICAL: Heat loss ({heat_loss:.2f}) is SEVERELY above target. The current penalty is too weak.")
+        suggestions.append(f"   - ACTION: {AGGRESSIVE} heat_params. Make the penalty painful enough to force equipment usage (e.g., electric boiler/FC heat).")
+    
+    elif heat_loss_eval == "not good":
+        suggestions.append(f"   - STATUS: Heat loss is not ideal. {MODERATE} heat_params.")
+    
+    elif heat_loss_eval == "good":
+        if total_cost > 1e6:
+            suggestions.append(f"   - STATUS: Heat loss controlled ({heat_loss:.2f}), cost high. {SLIGHT_DEC} heat penalties to improve economy.")
+        else:
+            suggestions.append("   - STATUS: Heat loss is well-controlled. Fine-tune for stability.")
+    
+    else:  # "very good"
+        suggestions.append("   - STATUS: Heat loss is very low. Minimize heat parameter changes unless cost optimization requires it.")
+
+    if power_loss_eval == "bad" and heat_loss_eval == "bad":
+        suggestions.append("5. EMERGENCY PROTOCOL:")
+        suggestions.append("   - SITUATION: Both Power and Heat constraints are failing completely.")
+        suggestions.append("   - CONCLUSION: The agent is stuck in a local optimum where it ignores constraints to save money.")
+        suggestions.append("   - OVERRIDE: Do NOT worry about Total Cost increase. Drastically increase ALL parameters to break the agent out of this state.")
+
+    suggestions.append("6. ECONOMIC FINE-TUNING (Only if constraints are met):")
+    if h2_cost > component_operation_cost + pv_curtailment_cost:
+        suggestions.append("   - H2 cost is dominant. If losses are low, check if penalties are too high, causing panic-buying of H2.")
+    elif pv_curtailment_cost > h2_cost + component_operation_cost:
+        suggestions.append("   - PV curtailment is high. Ensure penalties don't discourage using PV for power/heat.")
+    if power_loss_eval == "bad" and heat_loss_eval != "bad":
+        suggestions.append("IMBALANCE DETECTED: Heat Loss is improving but Power Loss is WORSENING significantly.")
+        suggestions.append("   - The agent is prioritizing Heat over Power due to excessive Heat penalties.")
+        suggestions.append("   - ACTION: INCREASE Power parameters AND DECREASE Heat parameters to restore balance.")
+    
+    if heat_loss > 1000 and current_params["heat_params"]["eta1"] > 800000:
+        suggestions.append("PHYSICAL LIMIT WARNING: Heat parameters are massive (>800k) but Heat Loss remains high (~2900).")
+        suggestions.append("   - This indicates a HARD PHYSICAL CONSTRAINT (e.g., equipment capacity limit).")
+        suggestions.append("   - Increasing Heat parameters further will likely yield ZERO improvement and may destabilize training.")
+        suggestions.append("   - ACTION: STOP increasing Heat parameters. Maintain them at current levels.")
+        suggestions.append("   - FOCUS: Instead, increase Power parameters to eliminate the remaining Power Loss (391).")
+                
+    suggestions.extend([
+        "7. FINAL GUIDELINES:",
+        "- Output ONLY JSON. No explanations.",
+        "- Maintain Monotonicity: eta1 >= eta2 >= eta3 is MANDATORY for both sets.",
+        "- Hierarchy: Safety (Loss < 10) > Economy (Cost). First fix the loss, then fix the cost.",
+        "- Magnitude: Don't be afraid to double parameters (e.g. 50 -> 100) if losses are > 1000.",
+        ""
+    ])
+    
+    return suggestions
