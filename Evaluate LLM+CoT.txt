@@ -24,10 +24,10 @@ def evaluate_reward_function_with_llm(power_loss, heat_loss, prev_power_loss, pr
 
     evaluation_prompt = f"""
 You are an expert in energy system optimization (Hydrogen-based Multi-energy System).
-Please evaluate the Power Loss and Heat Loss reliability based on the current simulation results (28-day cumulative) compared to the previous iteration.
+Please evaluate the Power Loss and Heat Loss reliability based on the current simulation results (30-day cumulative) compared to the previous iteration.
 
 ### Data Overview
-1. Economic Indicators (28 days):
+1. Economic Indicators (30 days):
 Total  Cost: {total_cost:.2f} Yuan
 Hydrogen Cost: {h2_cost:.2f} Yuan
 Equipment Operation Cost: {component_operation_cost:.2f} Yuan
